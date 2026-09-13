@@ -1,0 +1,20 @@
+{
+  "name": "ai-coding-agent-orchestrator",
+  "version": "1.0.0",
+  "description": "Orchestrator: Gemini tool-calling loop + E2B sandbox execution, for Cloud Run",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "e2b": "^1.0.0",
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5"
+  }
+}
