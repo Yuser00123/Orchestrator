@@ -1,0 +1,6 @@
+{
+  "name": "AI Coding Agent Orchestrator",
+  "description": "Orchestrator backend connecting Gemini function-calling loop with E2B sandbox execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

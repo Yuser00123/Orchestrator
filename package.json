@@ -8,13 +8,16 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node index.js"
+    "dev": "node index.js",
+    "build": "echo 'Build complete'",
+    "start": "node index.js",
+    "lint": "node --check index.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
-    "e2b": "^1.0.0",
-    "express": "^4.19.2",
+    "@google/genai": "^2.22.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "e2b": "^1.0.0",
+    "express": "^4.19.2"
   }
 }

@@ -1,27 +1,43 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenAI } from '@google/genai';
 import { Sandbox } from 'e2b';
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const PORT = process.env.PORT || 8080;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const PORT = 3000;
 const E2B_API_KEY = process.env.E2B_API_KEY;
 const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const MAX_TOOL_LOOPS = 8; // safety cap so a stuck agent can't loop forever
 
-if (!GEMINI_API_KEY) console.warn('WARNING: GEMINI_API_KEY is not set');
+if (!process.env.GEMINI_API_KEY) console.warn('WARNING: GEMINI_API_KEY is not set');
 if (!E2B_API_KEY) console.warn('WARNING: E2B_API_KEY is not set');
 if (!GITHUB_USERNAME || !GITHUB_TOKEN) {
   console.warn('WARNING: GITHUB_USERNAME/GITHUB_TOKEN not set — commit_and_push tool will fail until set');
 }
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+let aiClient = null;
+function getGeminiClient() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY environment variable is required');
+  }
+  if (!aiClient) {
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        }
+      }
+    });
+  }
+  return aiClient;
+}
 
 // ---- In-memory sandbox registry (per session) ----
 // NOTE: Cloud Run can scale to multiple instances, and each instance has its
@@ -207,41 +223,44 @@ app.post('/chat', async (req, res) => {
 
   try {
     const sbx = await getOrCreateSandbox(sessionId);
+    const ai = getGeminiClient();
 
-    const model = genAI.getGenerativeModel({
+    const chat = ai.chats.create({
       model: 'gemini-2.0-flash',
-      tools: [{ functionDeclarations: toolDeclarations }]
-    });
-
-    const chat = model.startChat({
+      config: { tools: [{ functionDeclarations: toolDeclarations }] },
       history: history || []
     });
 
-    let response = await chat.sendMessage(message);
+    let response = await chat.sendMessage({ message });
     let loops = 0;
     const toolLog = [];
 
     // Keep resolving tool calls until Gemini returns a plain text answer
     // or we hit the safety cap.
     while (loops < MAX_TOOL_LOOPS) {
-      const call = response.response.functionCalls?.()?.[0];
-      if (!call) break;
+      const functionCalls = response.functionCalls;
+      if (!functionCalls || functionCalls.length === 0) break;
 
-      const toolResult = await executeTool(sbx, call.name, call.args || {});
-      toolLog.push({ tool: call.name, args: call.args, result: toolResult });
-
-      response = await chat.sendMessage([
-        {
+      const functionResponses = [];
+      for (const call of functionCalls) {
+        const toolResult = await executeTool(sbx, call.name, call.args || {});
+        toolLog.push({ tool: call.name, args: call.args, result: toolResult });
+        functionResponses.push({
           functionResponse: {
+            id: call.id,
             name: call.name,
             response: toolResult
           }
-        }
-      ]);
+        });
+      }
+
+      response = await chat.sendMessage({
+        message: functionResponses
+      });
       loops += 1;
     }
 
-    const finalText = response.response.text();
+    const finalText = response.text || '';
 
     res.json({
       reply: finalText,
@@ -272,6 +291,18 @@ app.post('/session/:sessionId/close', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-app.listen(PORT, () => {
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'AI Coding Agent Orchestrator',
+    endpoints: {
+      health: 'GET /health',
+      chat: 'POST /chat',
+      closeSession: 'POST /session/:sessionId/close'
+    }
+  });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Orchestrator listening on port ${PORT}`);
 });
