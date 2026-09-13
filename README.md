@@ -6,8 +6,8 @@ Node.js/Express backend that connects your AI Studio frontend to Gemini
 ## What it does
 
 1. Frontend calls `POST /chat` with `{ message, sessionId, history }`.
-2. Orchestrator sends the message to Gemini with 4 tools defined:
-   `run_command`, `write_file`, `read_file`, `list_files`.
+2. Orchestrator sends the message to Gemini with 5 tools defined:
+   `run_command`, `write_file`, `read_file`, `list_files`, `commit_and_push`.
 3. When Gemini calls a tool, the orchestrator runs it inside an E2B sandbox
    tied to that `sessionId` (so the same project/session keeps its files
    between messages).
@@ -35,8 +35,15 @@ curl -X POST http://localhost:8080/chat \
 
 1. Push this folder to a GitHub repo.
 2. In AI Studio, import the project from GitHub.
-3. Set `GEMINI_API_KEY` and `E2B_API_KEY` as environment variables /
-   secrets in the Cloud Run service configuration (never commit `.env`).
+3. Set `GEMINI_API_KEY`, `E2B_API_KEY`, `GITHUB_USERNAME`, and
+   `GITHUB_TOKEN` as environment variables / secrets in the Cloud Run
+   service configuration (never commit `.env`).
+   - `GITHUB_TOKEN`: generate at GitHub -> Settings -> Developer settings
+     -> Personal access tokens -> Fine-grained tokens, scoped to just the
+     repo(s) you want the agent to push to.
+   - The token is only ever read server-side to build the git remote URL;
+     Gemini and the frontend never see it (only the repo name and commit
+     message pass through the model).
 4. Deploy. Note the generated `*.run.app` URL — point your frontend's
    `/chat` calls at `<that-url>/chat`.
 
@@ -58,9 +65,14 @@ change.
   handle a "sandbox expired" error by creating a fresh one and having the
   agent `git pull`/re-clone its own last commit to resume.
 
+## Using commit_and_push
+
+The agent can call this on its own when it decides a task is done — e.g.
+after writing and testing code, Gemini may call
+`commit_and_push({ repo: "yourname/my-project", commitMessage: "Add hello world script" })`.
+The target repo must already exist on GitHub (create it first, empty is fine).
+
 ## Extending
 
-- Add a `git_commit_and_push` tool if you want the agent itself to decide
-  when to push to GitHub, instead of triggering it from your frontend.
 - Add authentication (a shared secret header) on `/chat` before deploying
   publicly, since Cloud Run URLs are reachable by anyone who has the link.

@@ -11,10 +11,15 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const E2B_API_KEY = process.env.E2B_API_KEY;
+const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const MAX_TOOL_LOOPS = 8; // safety cap so a stuck agent can't loop forever
 
 if (!GEMINI_API_KEY) console.warn('WARNING: GEMINI_API_KEY is not set');
 if (!E2B_API_KEY) console.warn('WARNING: E2B_API_KEY is not set');
+if (!GITHUB_USERNAME || !GITHUB_TOKEN) {
+  console.warn('WARNING: GITHUB_USERNAME/GITHUB_TOKEN not set — commit_and_push tool will fail until set');
+}
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
@@ -92,6 +97,30 @@ const toolDeclarations = [
         path: { type: 'string', description: 'Directory path to list (optional).' }
       }
     }
+  },
+  {
+    name: 'commit_and_push',
+    description:
+      'Commit all current changes in the project and push them to a GitHub repository. Use this when a task or project is complete and ready to save permanently.',
+    parameters: {
+      type: 'object',
+      properties: {
+        repo: {
+          type: 'string',
+          description:
+            'Target repo in "owner/repo-name" format, e.g. "yourname/my-project". If the repo does not exist yet, create it on GitHub first.'
+        },
+        commitMessage: {
+          type: 'string',
+          description: 'Commit message describing the changes (optional, defaults to a generic message).'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project directory to push (optional, defaults to current directory).'
+        }
+      },
+      required: ['repo']
+    }
   }
 ];
 
@@ -121,6 +150,44 @@ async function executeTool(sbx, name, args) {
       case 'list_files': {
         const entries = await sbx.files.list(args.path || '.');
         return { entries };
+      }
+      case 'commit_and_push': {
+        if (!GITHUB_USERNAME || !GITHUB_TOKEN) {
+          return { error: 'GITHUB_USERNAME/GITHUB_TOKEN not configured on the server' };
+        }
+        const cwd = args.cwd || '.';
+        const msg = (args.commitMessage || 'Update from AI agent').replace(/"/g, '\\"');
+        // Token is injected here on the server side only — Gemini never sees
+        // the raw token, since it only ever supplies "repo" and "commitMessage".
+        const remoteUrl = `https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/${args.repo}.git`;
+
+        const steps = [
+          `git rev-parse --is-inside-work-tree || git init`,
+          `git config user.email "agent@local"`,
+          `git config user.name "${GITHUB_USERNAME}"`,
+          `git add -A`,
+          `git commit -m "${msg}" --allow-empty`,
+          `git branch -M main`,
+          `git remote remove origin 2>/dev/null; git remote add origin "${remoteUrl}"`,
+          `git push -u origin main`
+        ];
+
+        const output = [];
+        for (const step of steps) {
+          const result = await sbx.commands.run(step, { cwd, timeoutMs: 60000 });
+          // Redact the token if it ever leaks into stdout/stderr before logging/returning
+          const redact = (s) => (s || '').replaceAll(GITHUB_TOKEN, '***');
+          output.push({
+            step: step.includes(GITHUB_TOKEN) ? step.replace(GITHUB_TOKEN, '***') : step,
+            stdout: redact(result.stdout),
+            stderr: redact(result.stderr),
+            exitCode: result.exitCode
+          });
+          if (result.exitCode !== 0 && step.includes('push')) {
+            return { error: 'git push failed', steps: output };
+          }
+        }
+        return { success: true, steps: output };
       }
       default:
         return { error: `Unknown tool: ${name}` };
