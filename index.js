@@ -13,6 +13,19 @@ if (!admin.apps.length) {
   admin.initializeApp(); // uses Application Default Credentials on Cloud Run automatically
 }
 const db = admin.firestore();
+let storageBucket;
+try {
+  storageBucket = admin.storage().bucket();
+} catch {
+  storageBucket = admin.storage().bucket(process.env.STORAGE_BUCKET || 'default');
+}
+
+async function uploadToFirebaseStorage(buffer, filename, contentType) {
+  const file = storageBucket.file(`agent-outputs/${Date.now()}-${filename}`);
+  await file.save(buffer, { metadata: { contentType } });
+  const [url] = await file.getSignedUrl({ action: 'read', expires: '03-01-2500' });
+  return url;
+}
 
 const app = express();
 app.use(cors());
@@ -23,7 +36,8 @@ const PROJECT_DIR = '/home/user/project';
 const SKILLS_DIR = '/home/user/skills';
 const UI_SKILLS_INSTRUCTION =
   'Before building or styling a webpage or UI, check /home/user/skills/anthropic/ (via list_files) for frontend-design or web-artifacts-builder guidance, and read the relevant SKILL.md if it applies. ' +
-  'If the task involves Supabase (database, auth, storage, edge functions, RLS policies), check /home/user/skills/supabase/ (via list_files) and read the relevant SKILL.md. Since no Supabase MCP server is connected, use its documented fallback: fetch a docs page as markdown by appending .md to its URL via browse_webpage, or use web_search for anything else.';
+  'If the task involves Supabase (database, auth, storage, edge functions, RLS policies), check /home/user/skills/supabase/ (via list_files) and read the relevant SKILL.md. Since no Supabase MCP server is connected, use its documented fallback: fetch a docs page as markdown by appending .md to its URL via browse_webpage, or use web_search for anything else.' +
+  ' Before the first git commit in any project, check /home/user/skills/git-workflow.md and create a .gitignore first.';
 const FALLBACK_CHAIN = [
   { provider: 'gemini', model: 'gemini-3.6-flash' },
   { provider: 'gemini', model: 'gemini-3.5-flash-lite' },
@@ -169,6 +183,16 @@ async function getOrCreateSandbox(sessionId) {
 - Prefer a preview deployment first so the user can review before anything goes to production.
 - Never print or echo token/environment variable values in any command output.
 `);
+  await sbx.files.write(`${SKILLS_DIR}/git-workflow.md`, `# Git Workflow Skill
+
+## Before your first commit in any new project
+- Always create a .gitignore FIRST, before running "git add" for the first time. At minimum, exclude: node_modules, dist, build, .env, __pycache__, *.pyc, .DS_Store — plus anything else specific to the project's language/framework.
+- Never commit node_modules or build output (dist, build) — these are reconstructable from package.json/package-lock.json and a build command, and bloat the repository.
+- Run "git status" before committing to see what will actually be included, and check the file list looks right before proceeding.
+
+## Ongoing
+- Only force-push when a push is rejected due to unrelated remote history (see commit_and_push's automatic handling of this) — never as a routine habit.
+`);
   try {
     await sbx.commands.run(
       `git clone --depth 1 https://github.com/anthropics/skills.git /tmp/anthropic-skills-src 2>&1 && ` +
@@ -312,15 +336,25 @@ const toolDeclarations = [
   },
   {
     name: 'deploy_preview_cloudflare',
-    description: 'Deploy the current project to Cloudflare Pages for a quick preview URL. Read /home/user/skills/deployment.md first if unsure how to use this.',
+    description:
+      'Deploy the current project to Cloudflare Pages for a quick preview URL. If projectName is omitted and this session has deployed before, the previous project name is reused automatically.',
     parameters: {
       type: 'object',
       properties: {
-        projectName: { type: 'string', description: 'Cloudflare Pages project name (will be created if it does not exist).' },
-        buildDir: { type: 'string', description: 'Directory containing the built/static site to deploy (e.g. "dist" or "build"). Defaults to the project root if not specified.' },
-        cwd: { type: 'string', description: 'Project directory to run the deploy from (optional, defaults to the project root).' }
-      },
-      required: ['projectName']
+        projectName: {
+          type: 'string',
+          description: 'Cloudflare Pages project name (will be created if it does not exist).'
+        },
+        buildDir: {
+          type: 'string',
+          description:
+            'Directory containing the built/static site to deploy (e.g. "dist" or "build"). Defaults to the project root if not specified.'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project directory to run the deploy from (optional, defaults to the project root).'
+        }
+      }
     }
   },
   {
@@ -347,7 +381,7 @@ const toolDeclarations = [
   },
   {
     name: 'take_screenshot',
-    description: 'Take a screenshot of a URL (e.g. a deployed preview) and save it as an image file in the project, so you and the user can visually verify what was deployed.',
+    description: 'Take a screenshot of a URL (e.g. a deployed preview) and save it as an image file in the project, so you and the user can visually verify what was deployed. The tool result includes a \'url\' field — always use that URL (not the local file path) when referencing this image in your reply to the user.',
     parameters: {
       type: 'object',
       properties: {
@@ -370,7 +404,7 @@ const toolDeclarations = [
   },
   {
     name: 'generate_image',
-    description: 'Generate an image from a text description (e.g. for a placeholder logo or hero image) and save it into the project.',
+    description: 'Generate an image from a text description (e.g. for a placeholder logo or hero image) and save it into the project. The tool result includes a \'url\' field — always use that URL (not the local file path) when referencing this image in your reply to the user.',
     parameters: {
       type: 'object',
       properties: {
@@ -569,11 +603,33 @@ async function executeTool(sbx, name, args, sessionId) {
         const cfToken = process.env.CLOUDFLARE_API_TOKEN;
         const cfAccountId = process.env.CLOUDFLARE_ACCOUNT_ID;
         if (!cfToken || !cfAccountId) return { error: 'CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID not configured on the server' };
+        let projectName = args.projectName;
+        if (!projectName) {
+          try {
+            const doc = await db.collection('agent_sessions').doc(sessionId).get();
+            if (doc.exists && doc.data().cloudflareProjectName) {
+              projectName = doc.data().cloudflareProjectName;
+            }
+          } catch (err) {
+            console.warn('Failed to look up existing Cloudflare project name (non-fatal):', err.message);
+          }
+        }
+        if (!projectName) {
+          return { error: 'No projectName provided and no previous Cloudflare project found for this session. Provide a projectName to start a new deployment.' };
+        }
         const cwd = args.cwd || PROJECT_DIR;
         const deployDir = args.buildDir || '.';
-        const command = `export NVM_DIR="$HOME/.nvm"; if [ ! -s "$NVM_DIR/nvm.sh" ]; then curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash > /dev/null 2>&1; fi; \\. "$NVM_DIR/nvm.sh"; nvm install 22 > /dev/null 2>&1; nvm use 22 > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages project create "${args.projectName}" --production-branch main > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages deploy ${deployDir} --project-name="${args.projectName}"`;
+        const command = `export NVM_DIR="$HOME/.nvm"; if [ ! -s "$NVM_DIR/nvm.sh" ]; then curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash > /dev/null 2>&1; fi; \\. "$NVM_DIR/nvm.sh"; nvm install 22 > /dev/null 2>&1; nvm use 22 > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages project create "${projectName}" --production-branch main > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages deploy ${deployDir} --project-name="${projectName}"`;
         try {
           const result = await sbx.commands.run(command, { cwd, timeoutMs: 240000 });
+          try {
+            await db.collection('agent_sessions').doc(sessionId).set(
+              { cloudflareProjectName: projectName },
+              { merge: true }
+            );
+          } catch (err) {
+            console.warn('Failed to save Cloudflare project name mapping (non-fatal):', err.message);
+          }
           return { stdout: redactSecrets(result.stdout), stderr: redactSecrets(result.stderr), exitCode: result.exitCode };
         } catch (err) {
           return { stdout: redactSecrets(err.stdout), stderr: redactSecrets(err.stderr || err.message), exitCode: err.exitCode !== undefined ? err.exitCode : 1 };
@@ -629,7 +685,13 @@ async function executeTool(sbx, name, args, sessionId) {
         const filename = args.filename || 'screenshot.png';
         const filePath = `${PROJECT_DIR}/${filename}`;
         await sbx.files.write(filePath, buffer);
-        return { success: true, path: filePath, sizeBytes: buffer.length };
+        let publicUrl = null;
+        try {
+          publicUrl = await uploadToFirebaseStorage(buffer, filename, 'image/png');
+        } catch (err) {
+          console.warn('Failed to upload screenshot to Firebase Storage (non-fatal):', err.message);
+        }
+        return { success: true, path: filePath, url: publicUrl, sizeBytes: buffer.length };
       }
       case 'clone_project': {
         if (!GITHUB_USERNAME || !GITHUB_TOKEN) {
@@ -656,7 +718,13 @@ async function executeTool(sbx, name, args, sessionId) {
         const filename = args.filename || 'generated-image.png';
         const filePath = `${PROJECT_DIR}/${filename}`;
         await sbx.files.write(filePath, buffer);
-        return { success: true, path: filePath, sizeBytes: buffer.length };
+        let publicUrl = null;
+        try {
+          publicUrl = await uploadToFirebaseStorage(buffer, filename, 'image/png');
+        } catch (err) {
+          console.warn('Failed to upload generated image to Firebase Storage (non-fatal):', err.message);
+        }
+        return { success: true, path: filePath, url: publicUrl, sizeBytes: buffer.length };
       }
       default:
         return { error: `Unknown tool: ${name}` };
