@@ -1,6 +1,6 @@
 {
   "name": "AI Coding Agent Orchestrator",
-  "description": "Orchestrator backend connecting Gemini function-calling loop with E2B sandbox execution.",
+  "description": "Orchestrator backend connecting multi-provider LLM function-calling loops (Gemini, Groq, Mistral, Cohere, OpenRouter) with E2B sandbox execution.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
