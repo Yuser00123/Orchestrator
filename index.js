@@ -13,18 +13,27 @@ if (!admin.apps.length) {
   admin.initializeApp(); // uses Application Default Credentials on Cloud Run automatically
 }
 const db = admin.firestore();
-let storageBucket;
-try {
-  storageBucket = admin.storage().bucket();
-} catch {
-  storageBucket = admin.storage().bucket(process.env.STORAGE_BUCKET || 'default');
-}
 
-async function uploadToFirebaseStorage(buffer, filename, contentType) {
-  const file = storageBucket.file(`agent-outputs/${Date.now()}-${filename}`);
-  await file.save(buffer, { metadata: { contentType } });
-  const [url] = await file.getSignedUrl({ action: 'read', expires: '03-01-2500' });
-  return url;
+async function uploadToCloudinary(buffer, filename) {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const uploadPreset = process.env.CLOUDINARY_UPLOAD_PRESET;
+  if (!cloudName || !uploadPreset) {
+    throw new Error('CLOUDINARY_CLOUD_NAME/CLOUDINARY_UPLOAD_PRESET not configured on the server');
+  }
+  const formData = new FormData();
+  formData.append('file', new Blob([buffer], { type: 'image/png' }), filename);
+  formData.append('upload_preset', uploadPreset);
+
+  const response = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+    method: 'POST',
+    body: formData
+  });
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Cloudinary upload failed: ${response.status} ${errText}`);
+  }
+  const data = await response.json();
+  return data.secure_url;
 }
 
 const app = express();
@@ -36,8 +45,10 @@ const PROJECT_DIR = '/home/user/project';
 const SKILLS_DIR = '/home/user/skills';
 const UI_SKILLS_INSTRUCTION =
   'Before building or styling a webpage or UI, check /home/user/skills/anthropic/ (via list_files) for frontend-design or web-artifacts-builder guidance, and read the relevant SKILL.md if it applies. ' +
+  'Unless the user asks for a specific subfolder structure, create and work directly in the project root (the current working directory) rather than nesting the project inside a named subfolder — deploy tools default to the project root, so files nested in a subfolder will not be found at the deployed site\'s root URL. ' +
   'If the task involves Supabase (database, auth, storage, edge functions, RLS policies), check /home/user/skills/supabase/ (via list_files) and read the relevant SKILL.md. Since no Supabase MCP server is connected, use its documented fallback: fetch a docs page as markdown by appending .md to its URL via browse_webpage, or use web_search for anything else.' +
-  ' Before the first git commit in any project, check /home/user/skills/git-workflow.md and create a .gitignore first.';
+  ' Before the first git commit in any project, check /home/user/skills/git-workflow.md and create a .gitignore first.' +
+  " If a tool result includes a 'url' field that is null, tell the user the file was saved but could not be uploaded to a shareable link — never invent, guess, or fabricate a URL.";
 const FALLBACK_CHAIN = [
   { provider: 'gemini', model: 'gemini-3.6-flash' },
   { provider: 'gemini', model: 'gemini-3.5-flash-lite' },
@@ -49,7 +60,13 @@ const FALLBACK_CHAIN = [
   { provider: 'mistral', model: 'ministral-8b-latest' },
   { provider: 'cohere', model: 'command-r-plus-08-2024' },
   { provider: 'cohere', model: 'command-r-08-2024' },
-  { provider: 'openrouter', model: 'openrouter/free' }
+  { provider: 'openrouter', model: 'openrouter/free' },
+  { provider: 'nvidia', model: 'meta/llama-3.2-11b-vision-instruct' },
+  { provider: 'nvidia', model: 'nvidia/nemotron-3-super-120b-a12b' },
+  { provider: 'nvidia', model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning' },
+  { provider: 'nvidia', model: 'z-ai/glm-5.3' },
+  { provider: 'nvidia', model: 'openai/gpt-oss-20b' },
+  { provider: 'nvidia', model: 'poolside/laguna-xs-2.1' }
 ];
 const E2B_API_KEY = process.env.E2B_API_KEY;
 const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
@@ -143,6 +160,16 @@ function getOpenRouterClient() {
   return openrouterClient;
 }
 
+let nvidiaClient = null;
+function getNvidiaClient() {
+  const apiKey = process.env.NVIDIA_API_KEY;
+  if (!apiKey) throw new Error('NVIDIA_API_KEY environment variable is required');
+  if (!nvidiaClient) {
+    nvidiaClient = new OpenAI({ apiKey, baseURL: 'https://integrate.api.nvidia.com/v1' });
+  }
+  return nvidiaClient;
+}
+
 // ---- In-memory sandbox registry (per session) ----
 // NOTE: Cloud Run can scale to multiple instances, and each instance has its
 // own memory. For a solo/single-user project, set Cloud Run's max instances
@@ -180,6 +207,7 @@ async function getOrCreateSandbox(sessionId) {
 - To delete a preview when the user asks to clean up, use the \`delete_cloudflare_preview\` tool with the project name. Never delete a project unless the user explicitly requests it.
 
 ## General
+- Unless the user asks for a specific subfolder structure, create and work directly in the project root (the current working directory) rather than nesting the project inside a named subfolder — deploy tools default to the project root, so files nested in a subfolder will not be found at the deployed site's root URL.
 - Prefer a preview deployment first so the user can review before anything goes to production.
 - Never print or echo token/environment variable values in any command output.
 `);
@@ -308,6 +336,19 @@ const toolDeclarations = [
         }
       },
       required: ['repo']
+    }
+  },
+  {
+    name: 'create_github_repo',
+    description: 'Create a new GitHub repository under the configured GitHub account. Use this before commit_and_push if the target repo does not exist yet, or when the user explicitly asks to create a new repo.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Repository name (no owner prefix, e.g. "my-new-project").' },
+        description: { type: 'string', description: 'Short description of the repo (optional).' },
+        private: { type: 'boolean', description: 'Whether the repo should be private (optional, defaults to false).' }
+      },
+      required: ['name']
     }
   },
   {
@@ -492,6 +533,29 @@ async function executeTool(sbx, name, args, sessionId) {
         if (!GITHUB_USERNAME || !GITHUB_TOKEN) {
           return { error: 'GITHUB_USERNAME/GITHUB_TOKEN not configured on the server' };
         }
+        try {
+          const checkResponse = await fetch(`https://api.github.com/repos/${args.repo}`, {
+            headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github+json' }
+          });
+          if (checkResponse.status === 404) {
+            const repoName = args.repo.split('/').pop();
+            const createResponse = await fetch('https://api.github.com/user/repos', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github+json',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ name: repoName, private: false })
+            });
+            if (!createResponse.ok) {
+              const errData = await createResponse.json();
+              return { error: `Repo did not exist and auto-creation failed: ${createResponse.status} ${errData.message || ''}` };
+            }
+          }
+        } catch (err) {
+          console.warn('Repo existence check/auto-create failed (continuing to attempt push anyway):', err.message);
+        }
         const cwd = args.cwd || PROJECT_DIR;
         const msg = (args.commitMessage || 'Update from AI agent').replace(/"/g, '\\"');
         // Token is injected here on the server side only — Gemini never sees
@@ -589,11 +653,34 @@ async function executeTool(sbx, name, args, sessionId) {
       case 'deploy_to_vercel': {
         const vercelToken = process.env.VERCEL_TOKEN;
         if (!vercelToken) return { error: 'VERCEL_TOKEN not configured on the server' };
+        let vercelProjectName = null;
+        try {
+          const doc = await db.collection('agent_sessions').doc(sessionId).get();
+          if (doc.exists && doc.data().vercelProjectName) {
+            vercelProjectName = doc.data().vercelProjectName;
+          }
+        } catch (err) {
+          console.warn('Failed to look up existing Vercel project name (non-fatal):', err.message);
+        }
+        if (!vercelProjectName) {
+          vercelProjectName = `agent-${sessionId.replace(/[^a-zA-Z0-9-]/g, '').slice(0, 40) || Date.now()}`;
+        }
         const cwd = args.cwd || PROJECT_DIR;
+        const linkCommand = `VERCEL_TOKEN="${vercelToken}" npx vercel link --yes --project="${vercelProjectName}"`;
+        try {
+          await sbx.commands.run(linkCommand, { cwd, timeoutMs: 60000 });
+        } catch (err) {
+          console.warn('Vercel link command failed (continuing to deploy anyway):', err.message);
+        }
         const prodFlag = args.production ? '--prod' : '';
         const command = `VERCEL_TOKEN="${vercelToken}" npx vercel deploy --yes ${prodFlag}`.trim();
         try {
           const result = await sbx.commands.run(command, { cwd, timeoutMs: 120000 });
+          try {
+            await db.collection('agent_sessions').doc(sessionId).set({ vercelProjectName }, { merge: true });
+          } catch (err) {
+            console.warn('Failed to save Vercel project name mapping (non-fatal):', err.message);
+          }
           return { stdout: redactSecrets(result.stdout), stderr: redactSecrets(result.stderr), exitCode: result.exitCode };
         } catch (err) {
           return { stdout: redactSecrets(err.stdout), stderr: redactSecrets(err.stderr || err.message), exitCode: err.exitCode !== undefined ? err.exitCode : 1 };
@@ -687,9 +774,9 @@ async function executeTool(sbx, name, args, sessionId) {
         await sbx.files.write(filePath, buffer);
         let publicUrl = null;
         try {
-          publicUrl = await uploadToFirebaseStorage(buffer, filename, 'image/png');
+          publicUrl = await uploadToCloudinary(buffer, filename);
         } catch (err) {
-          console.warn('Failed to upload screenshot to Firebase Storage (non-fatal):', err.message);
+          console.warn('Failed to upload screenshot to Cloudinary (non-fatal):', err.message);
         }
         return { success: true, path: filePath, url: publicUrl, sizeBytes: buffer.length };
       }
@@ -720,11 +807,32 @@ async function executeTool(sbx, name, args, sessionId) {
         await sbx.files.write(filePath, buffer);
         let publicUrl = null;
         try {
-          publicUrl = await uploadToFirebaseStorage(buffer, filename, 'image/png');
+          publicUrl = await uploadToCloudinary(buffer, filename);
         } catch (err) {
-          console.warn('Failed to upload generated image to Firebase Storage (non-fatal):', err.message);
+          console.warn('Failed to upload generated image to Cloudinary (non-fatal):', err.message);
         }
         return { success: true, path: filePath, url: publicUrl, sizeBytes: buffer.length };
+      }
+      case 'create_github_repo': {
+        if (!GITHUB_TOKEN) return { error: 'GITHUB_TOKEN not configured on the server' };
+        const response = await fetch('https://api.github.com/user/repos', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${GITHUB_TOKEN}`,
+            'Accept': 'application/vnd.github+json',
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            name: args.name,
+            description: args.description || '',
+            private: args.private || false
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          return { error: `GitHub repo creation failed: ${response.status} ${data.message || ''}` };
+        }
+        return { success: true, repo: data.full_name, url: data.html_url };
       }
       default:
         return { error: `Unknown tool: ${name}` };
@@ -792,7 +900,11 @@ function toCohereHistory(history) {
 }
 
 // ---- Provider turn runners ----
-async function runGeminiTurn(model, message, history, sbx, sessionId, onEvent = () => {}) {
+async function runGeminiTurn(model, message, history, sbx, sessionId, onEvent = () => {}, priorProgressNote = '') {
+  const effectiveMessage = priorProgressNote
+    ? `[Note: a previous attempt at this same request was interrupted. Here is what was already completed before the interruption — do not repeat these steps, continue from here:]\n${priorProgressNote}\n\n[Original request:]\n${message}`
+    : message;
+
   const ai = getGeminiClient();
   const chat = ai.chats.create({
     model,
@@ -803,9 +915,15 @@ async function runGeminiTurn(model, message, history, sbx, sessionId, onEvent = 
     history: toGeminiHistory(history)
   });
 
-  let response = await chat.sendMessage({ message });
-  let loops = 0;
   const toolLog = [];
+  let response;
+  try {
+    response = await chat.sendMessage({ message: effectiveMessage });
+  } catch (err) {
+    err.partialToolLog = toolLog;
+    throw err;
+  }
+  let loops = 0;
 
   while (loops < MAX_TOOL_LOOPS) {
     const functionCalls = response.functionCalls;
@@ -826,9 +944,14 @@ async function runGeminiTurn(model, message, history, sbx, sessionId, onEvent = 
       });
     }
 
-    response = await chat.sendMessage({
-      message: functionResponses
-    });
+    try {
+      response = await chat.sendMessage({
+        message: functionResponses
+      });
+    } catch (err) {
+      err.partialToolLog = toolLog;
+      throw err;
+    }
     loops += 1;
   }
 
@@ -836,23 +959,33 @@ async function runGeminiTurn(model, message, history, sbx, sessionId, onEvent = 
   return { reply, toolLog, loops };
 }
 
-async function runGroqTurn(model, message, history, sbx, sessionId, onEvent = () => {}) {
+async function runGroqTurn(model, message, history, sbx, sessionId, onEvent = () => {}, priorProgressNote = '') {
+  const effectiveMessage = priorProgressNote
+    ? `[Note: a previous attempt at this same request was interrupted. Here is what was already completed before the interruption — do not repeat these steps, continue from here:]\n${priorProgressNote}\n\n[Original request:]\n${message}`
+    : message;
+
   const groq = getGroqClient();
   const messages = [
     { role: 'system', content: UI_SKILLS_INSTRUCTION },
     ...toOpenAIHistory(history),
-    { role: 'user', content: message }
+    { role: 'user', content: effectiveMessage }
   ];
   let loops = 0;
   const toolLog = [];
 
   while (loops < MAX_TOOL_LOOPS) {
-    const completion = await groq.chat.completions.create({
-      model,
-      messages,
-      tools: toOpenAITools(toolDeclarations),
-      tool_choice: 'auto'
-    });
+    let completion;
+    try {
+      completion = await groq.chat.completions.create({
+        model,
+        messages,
+        tools: toOpenAITools(toolDeclarations),
+        tool_choice: 'auto'
+      });
+    } catch (err) {
+      err.partialToolLog = toolLog;
+      throw err;
+    }
 
     const choice = completion.choices?.[0];
     const msg = choice?.message;
@@ -889,23 +1022,33 @@ async function runGroqTurn(model, message, history, sbx, sessionId, onEvent = ()
   return { reply: (lastMsg?.role === 'assistant' ? lastMsg.content : '') || '', toolLog, loops };
 }
 
-async function runMistralTurn(model, message, history, sbx, sessionId, onEvent = () => {}) {
+async function runMistralTurn(model, message, history, sbx, sessionId, onEvent = () => {}, priorProgressNote = '') {
+  const effectiveMessage = priorProgressNote
+    ? `[Note: a previous attempt at this same request was interrupted. Here is what was already completed before the interruption — do not repeat these steps, continue from here:]\n${priorProgressNote}\n\n[Original request:]\n${message}`
+    : message;
+
   const mistral = getMistralClient();
   const messages = [
     { role: 'system', content: UI_SKILLS_INSTRUCTION },
     ...toOpenAIHistory(history),
-    { role: 'user', content: message }
+    { role: 'user', content: effectiveMessage }
   ];
   let loops = 0;
   const toolLog = [];
 
   while (loops < MAX_TOOL_LOOPS) {
-    const response = await mistral.chat.complete({
-      model,
-      messages,
-      tools: toOpenAITools(toolDeclarations),
-      toolChoice: 'auto'
-    });
+    let response;
+    try {
+      response = await mistral.chat.complete({
+        model,
+        messages,
+        tools: toOpenAITools(toolDeclarations),
+        toolChoice: 'auto'
+      });
+    } catch (err) {
+      err.partialToolLog = toolLog;
+      throw err;
+    }
 
     const choice = response.choices?.[0];
     const msg = choice?.message;
@@ -945,7 +1088,11 @@ async function runMistralTurn(model, message, history, sbx, sessionId, onEvent =
   return { reply, toolLog, loops };
 }
 
-async function runCohereTurn(model, message, history, sbx, sessionId, onEvent = () => {}) {
+async function runCohereTurn(model, message, history, sbx, sessionId, onEvent = () => {}, priorProgressNote = '') {
+  const effectiveMessage = priorProgressNote
+    ? `[Note: a previous attempt at this same request was interrupted. Here is what was already completed before the interruption — do not repeat these steps, continue from here:]\n${priorProgressNote}\n\n[Original request:]\n${message}`
+    : message;
+
   const cohere = getCohereClient();
   let loops = 0;
   const toolLog = [];
@@ -954,14 +1101,20 @@ async function runCohereTurn(model, message, history, sbx, sessionId, onEvent = 
   const tools = toCohereTools(toolDeclarations);
 
   while (loops < MAX_TOOL_LOOPS) {
-    const response = await cohere.chat({
-      model,
-      message,
-      preamble: UI_SKILLS_INSTRUCTION,
-      chatHistory,
-      tools,
-      toolResults
-    });
+    let response;
+    try {
+      response = await cohere.chat({
+        model,
+        message: effectiveMessage,
+        preamble: UI_SKILLS_INSTRUCTION,
+        chatHistory,
+        tools,
+        toolResults
+      });
+    } catch (err) {
+      err.partialToolLog = toolLog;
+      throw err;
+    }
 
     const toolCalls = response.toolCalls;
     if (!toolCalls || toolCalls.length === 0) {
@@ -987,23 +1140,96 @@ async function runCohereTurn(model, message, history, sbx, sessionId, onEvent = 
   return { reply: '', toolLog, loops };
 }
 
-async function runOpenRouterTurn(model, message, history, sbx, sessionId, onEvent = () => {}) {
+async function runOpenRouterTurn(model, message, history, sbx, sessionId, onEvent = () => {}, priorProgressNote = '') {
+  const effectiveMessage = priorProgressNote
+    ? `[Note: a previous attempt at this same request was interrupted. Here is what was already completed before the interruption — do not repeat these steps, continue from here:]\n${priorProgressNote}\n\n[Original request:]\n${message}`
+    : message;
+
   const openrouter = getOpenRouterClient();
   const messages = [
     { role: 'system', content: UI_SKILLS_INSTRUCTION },
     ...toOpenAIHistory(history),
-    { role: 'user', content: message }
+    { role: 'user', content: effectiveMessage }
   ];
   let loops = 0;
   const toolLog = [];
 
   while (loops < MAX_TOOL_LOOPS) {
-    const completion = await openrouter.chat.completions.create({
-      model,
-      messages,
-      tools: toOpenAITools(toolDeclarations),
-      tool_choice: 'auto'
-    });
+    let completion;
+    try {
+      completion = await openrouter.chat.completions.create({
+        model,
+        messages,
+        tools: toOpenAITools(toolDeclarations),
+        tool_choice: 'auto'
+      });
+    } catch (err) {
+      err.partialToolLog = toolLog;
+      throw err;
+    }
+
+    const choice = completion.choices?.[0];
+    const msg = choice?.message;
+    const toolCalls = msg?.tool_calls;
+
+    if (!toolCalls || toolCalls.length === 0) {
+      return { reply: msg?.content || '', toolLog, loops };
+    }
+
+    messages.push(msg);
+
+    for (const call of toolCalls) {
+      let args = {};
+      try {
+        args = typeof call.function?.arguments === 'string' ? JSON.parse(call.function.arguments || '{}') : (call.function?.arguments || {});
+      } catch {
+        args = {};
+      }
+      onEvent({ type: 'tool_start', tool: call.function?.name, args });
+      const toolResult = await executeTool(sbx, call.function?.name, args, sessionId);
+      onEvent({ type: 'tool_end', tool: call.function?.name, success: !toolResult.error });
+      toolLog.push({ tool: call.function?.name, args, result: toolResult });
+      messages.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        content: JSON.stringify(toolResult)
+      });
+    }
+
+    loops += 1;
+  }
+
+  const lastMsg = messages[messages.length - 1];
+  return { reply: (lastMsg?.role === 'assistant' ? lastMsg.content : '') || '', toolLog, loops };
+}
+
+async function runNvidiaTurn(model, message, history, sbx, sessionId, onEvent = () => {}, priorProgressNote = '') {
+  const effectiveMessage = priorProgressNote
+    ? `[Note: a previous attempt at this same request was interrupted. Here is what was already completed before the interruption — do not repeat these steps, continue from here:]\n${priorProgressNote}\n\n[Original request:]\n${message}`
+    : message;
+
+  const nvidia = getNvidiaClient();
+  const messages = [
+    { role: 'system', content: UI_SKILLS_INSTRUCTION },
+    ...toOpenAIHistory(history),
+    { role: 'user', content: effectiveMessage }
+  ];
+  let loops = 0;
+  const toolLog = [];
+
+  while (loops < MAX_TOOL_LOOPS) {
+    let completion;
+    try {
+      completion = await nvidia.chat.completions.create({
+        model,
+        messages,
+        tools: toOpenAITools(toolDeclarations),
+        tool_choice: 'auto'
+      });
+    } catch (err) {
+      err.partialToolLog = toolLog;
+      throw err;
+    }
 
     const choice = completion.choices?.[0];
     const msg = choice?.message;
@@ -1045,39 +1271,51 @@ const PROVIDER_RUNNERS = {
   groq: runGroqTurn,
   mistral: runMistralTurn,
   cohere: runCohereTurn,
-  openrouter: runOpenRouterTurn
+  openrouter: runOpenRouterTurn,
+  nvidia: runNvidiaTurn
 };
 
 // ---- Chat runner with multi-provider fallback ----
-async function runChatWithFallback(message, history, sbx, sessionId, onEvent = () => {}) {
-  let lastError = null;
+async function runChatWithFallback(message, history, sbx, sessionId, onEvent = () => {}, preferredModel = null) {
+  let chainToTry = FALLBACK_CHAIN;
+  if (preferredModel && preferredModel.provider && preferredModel.model) {
+    const alreadyInChain = FALLBACK_CHAIN.some(
+      e => e.provider === preferredModel.provider && e.model === preferredModel.model
+    );
+    chainToTry = alreadyInChain
+      ? [preferredModel, ...FALLBACK_CHAIN.filter(e => !(e.provider === preferredModel.provider && e.model === preferredModel.model))]
+      : [preferredModel, ...FALLBACK_CHAIN];
+  }
 
-  for (const { provider, model } of FALLBACK_CHAIN) {
-    const runner = PROVIDER_RUNNERS[provider];
-    if (!runner) {
-      console.warn(`No runner defined for provider: ${provider}`);
-      continue;
-    }
+  let accumulatedToolLog = [];
+  let progressNote = '';
 
+  for (const { provider, model } of chainToTry) {
     try {
       onEvent({ type: 'model_selected', provider, model });
-      const { reply, toolLog, loops } = await runner(model, message, history, sbx, sessionId, onEvent);
+      const runner = PROVIDER_RUNNERS[provider];
+      const { reply, toolLog, loops } = await runner(model, message, history, sbx, sessionId, onEvent, progressNote);
       return {
         reply,
-        toolLog,
+        toolLog: [...accumulatedToolLog, ...toolLog],
         loopsUsed: loops,
         hitLoopCap: loops >= MAX_TOOL_LOOPS,
         modelUsed: `${provider}:${model}`
       };
     } catch (err) {
-      const errMsg = err?.message || String(err);
+      const errMsg = (err && (err.message || String(err))) || '';
+      console.warn(`Provider ${provider}/${model} failed: ${errMsg}`);
       onEvent({ type: 'model_failed', provider, model, error: errMsg });
-      console.warn(`Provider ${provider} (${model}) failed: ${errMsg}. Trying next in fallback chain...`);
-      lastError = err;
+      if (err.partialToolLog && err.partialToolLog.length > 0) {
+        accumulatedToolLog = [...accumulatedToolLog, ...err.partialToolLog];
+        progressNote = err.partialToolLog
+          .map(t => `- Called ${t.tool} with ${JSON.stringify(t.args)} → ${t.result?.error ? 'failed: ' + t.result.error : 'succeeded'}`)
+          .join('\n');
+      }
+      continue;
     }
   }
-
-  throw new Error(`All fallback providers and models exhausted. Last error: ${lastError?.message || 'Unknown error'}`);
+  throw new Error('All providers in the fallback chain failed.');
 }
 
 function extractVisitedUrls(toolLog) {
@@ -1097,7 +1335,7 @@ function extractVisitedUrls(toolLog) {
 
 // ---- Main chat endpoint: runs the multi-provider <-> E2B tool-calling loop ----
 app.post('/chat', requireAppSecret, async (req, res) => {
-  const { message, sessionId, history } = req.body;
+  const { message, sessionId, history, preferredModel } = req.body;
 
   if (!message || !sessionId) {
     return res.status(400).json({ error: 'message and sessionId are required' });
@@ -1105,7 +1343,11 @@ app.post('/chat', requireAppSecret, async (req, res) => {
 
   try {
     const sbx = await getOrCreateSandbox(sessionId);
-    const result = await runChatWithFallback(message, history, sbx, sessionId);
+    const result = await runChatWithFallback(message, history, sbx, sessionId, () => {}, preferredModel);
+    if ((!result.reply || !result.reply.trim()) && result.hitLoopCap) {
+      const toolNames = result.toolLog.map(t => t.tool).join(', ');
+      result.reply = `I ran out of steps before finishing this task. So far I used these tools: ${toolNames || 'none'}. Try asking me to continue, or break the task into smaller steps.`;
+    }
     res.json({
       ...result,
       visitedUrls: extractVisitedUrls(result.toolLog)
@@ -1117,7 +1359,7 @@ app.post('/chat', requireAppSecret, async (req, res) => {
 });
 
 app.post('/chat/stream', requireAppSecret, async (req, res) => {
-  const { message, sessionId, history } = req.body;
+  const { message, sessionId, history, preferredModel } = req.body;
   if (!message || !sessionId) {
     return res.status(400).json({ error: 'message and sessionId are required' });
   }
@@ -1134,7 +1376,11 @@ app.post('/chat/stream', requireAppSecret, async (req, res) => {
 
   try {
     const sbx = await getOrCreateSandbox(sessionId);
-    const result = await runChatWithFallback(message, history, sbx, sessionId, send);
+    const result = await runChatWithFallback(message, history, sbx, sessionId, send, preferredModel);
+    if ((!result.reply || !result.reply.trim()) && result.hitLoopCap) {
+      const toolNames = result.toolLog.map(t => t.tool).join(', ');
+      result.reply = `I ran out of steps before finishing this task. So far I used these tools: ${toolNames || 'none'}. Try asking me to continue, or break the task into smaller steps.`;
+    }
     send({
       type: 'done',
       reply: result.reply,
@@ -1167,6 +1413,10 @@ app.post('/session/:sessionId/close', requireAppSecret, async (req, res) => {
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.get('/models', (req, res) => {
+  res.json({ models: FALLBACK_CHAIN });
+});
 
 app.get('/', (req, res) => {
   res.json({
