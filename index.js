@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import path from 'path';
 import express from 'express';
 import cors from 'cors';
 import { GoogleGenAI } from '@google/genai';
@@ -13,6 +14,10 @@ if (!admin.apps.length) {
   admin.initializeApp(); // uses Application Default Credentials on Cloud Run automatically
 }
 const db = admin.firestore();
+
+function shellQuote(str) {
+  return `'${String(str).replace(/'/g, `'\\''`)}'`;
+}
 
 async function uploadToCloudinary(buffer, filename) {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
@@ -37,12 +42,34 @@ async function uploadToCloudinary(buffer, filename) {
 }
 
 const app = express();
-app.use(cors());
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:3000').split(',').map(s => s.trim());
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  }
+}));
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = 3000;
 const PROJECT_DIR = '/home/user/project';
 const SKILLS_DIR = '/home/user/skills';
+
+function resolveInWorkspace(inputPath, allowedRoots = [PROJECT_DIR]) {
+  const candidateRoots = allowedRoots.map(r => path.resolve(r));
+  const target = path.isAbsolute(inputPath || '')
+    ? path.resolve(inputPath)
+    : path.resolve(PROJECT_DIR, inputPath || '.');
+  const isAllowed = candidateRoots.some(root => target === root || target.startsWith(root + path.sep));
+  if (!isAllowed) {
+    throw new Error(`Path "${inputPath}" resolves outside the allowed workspace.`);
+  }
+  return target;
+}
+
 const UI_SKILLS_INSTRUCTION =
   'Before building or styling a webpage or UI, check /home/user/skills/anthropic/ (via list_files) for frontend-design or web-artifacts-builder guidance, and read the relevant SKILL.md if it applies. ' +
   'Unless the user asks for a specific subfolder structure, create and work directly in the project root (the current working directory) rather than nesting the project inside a named subfolder — deploy tools default to the project root, so files nested in a subfolder will not be found at the deployed site\'s root URL. ' +
@@ -90,10 +117,12 @@ if (!GITHUB_USERNAME || !GITHUB_TOKEN) {
 }
 
 const APP_SECRET = process.env.APP_SECRET;
-if (!APP_SECRET) console.warn('WARNING: APP_SECRET is not set — /chat and /session endpoints are unprotected');
+if (!APP_SECRET) console.warn('WARNING: APP_SECRET is not set');
 
 function requireAppSecret(req, res, next) {
-  if (!APP_SECRET) return next(); // not configured yet, don't lock the user out accidentally
+  if (!APP_SECRET) {
+    return res.status(500).json({ error: 'Server authentication is not configured' });
+  }
   const provided = req.headers['x-app-secret'];
   if (provided !== APP_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -176,6 +205,7 @@ function getNvidiaClient() {
 // to 1 in the service settings so this Map stays consistent across requests.
 // sandboxes: sessionId -> { sandbox, lastUsed: <timestamp> }
 const sandboxes = new Map();
+const sandboxCreationLocks = new Map(); // sessionId -> Promise
 
 async function getOrCreateSandbox(sessionId) {
   let entry = sandboxes.get(sessionId);
@@ -189,10 +219,34 @@ async function getOrCreateSandbox(sessionId) {
       sandboxes.delete(sessionId);
     }
   }
-  const sbx = await Sandbox.create({ apiKey: E2B_API_KEY });
-  await sbx.commands.run(`mkdir -p ${PROJECT_DIR}`);
-  await sbx.commands.run(`mkdir -p ${SKILLS_DIR}`);
-  await sbx.files.write(`${SKILLS_DIR}/deployment.md`, `# Deployment Skill: Vercel & Cloudflare Pages
+
+  if (sandboxCreationLocks.has(sessionId)) {
+    return sandboxCreationLocks.get(sessionId);
+  }
+
+  const creationPromise = (async () => {
+    try {
+      const doc = await db.collection('agent_sessions').doc(sessionId).get();
+      if (doc.exists && doc.data().e2bSandboxId) {
+        const reconnected = await Sandbox.connect(doc.data().e2bSandboxId, { apiKey: E2B_API_KEY });
+        await reconnected.commands.run('echo ok', { timeoutMs: 5000 }); // verify it's still alive
+        sandboxes.set(sessionId, { sandbox: reconnected, lastUsed: Date.now() });
+        return reconnected;
+      }
+    } catch (err) {
+      console.warn(`Could not reconnect to previous sandbox for session ${sessionId} (will create new):`, err.message);
+    }
+
+    const sbx = await Sandbox.create({ apiKey: E2B_API_KEY });
+    try {
+      await db.collection('agent_sessions').doc(sessionId).set({ e2bSandboxId: sbx.sandboxId }, { merge: true });
+    } catch (err) {
+      console.warn('Failed to persist e2bSandboxId to Firestore (non-fatal):', err.message);
+    }
+
+    await sbx.commands.run(`mkdir -p ${PROJECT_DIR}`);
+    await sbx.commands.run(`mkdir -p ${SKILLS_DIR}`);
+    await sbx.files.write(`${SKILLS_DIR}/deployment.md`, `# Deployment Skill: Vercel & Cloudflare Pages
 
 ## Vercel
 - Deploy with the \`deploy_to_vercel\` tool. It defaults to a **preview** deployment.
@@ -211,7 +265,7 @@ async function getOrCreateSandbox(sessionId) {
 - Prefer a preview deployment first so the user can review before anything goes to production.
 - Never print or echo token/environment variable values in any command output.
 `);
-  await sbx.files.write(`${SKILLS_DIR}/git-workflow.md`, `# Git Workflow Skill
+    await sbx.files.write(`${SKILLS_DIR}/git-workflow.md`, `# Git Workflow Skill
 
 ## Before your first commit in any new project
 - Always create a .gitignore FIRST, before running "git add" for the first time. At minimum, exclude: node_modules, dist, build, .env, __pycache__, *.pyc, .DS_Store — plus anything else specific to the project's language/framework.
@@ -221,46 +275,54 @@ async function getOrCreateSandbox(sessionId) {
 ## Ongoing
 - Only force-push when a push is rejected due to unrelated remote history (see commit_and_push's automatic handling of this) — never as a routine habit.
 `);
-  try {
-    await sbx.commands.run(
-      `git clone --depth 1 https://github.com/anthropics/skills.git /tmp/anthropic-skills-src 2>&1 && ` +
-      `mkdir -p ${SKILLS_DIR}/anthropic && ` +
-      `for d in frontend-design web-artifacts-builder; do ` +
-      `if [ -d "/tmp/anthropic-skills-src/skills/$d" ]; then cp -r "/tmp/anthropic-skills-src/skills/$d" ${SKILLS_DIR}/anthropic/; fi; ` +
-      `done && rm -rf /tmp/anthropic-skills-src`,
-      { timeoutMs: 60000 }
-    );
-  } catch (err) {
-    console.warn('Failed to fetch Anthropic example skills (non-fatal):', err.message);
-  }
-  try {
-    await sbx.commands.run(
-      `git clone --depth 1 https://github.com/supabase/agent-skills.git /tmp/supabase-skills-src 2>&1 && ` +
-      `mkdir -p ${SKILLS_DIR}/supabase && ` +
-      `for d in supabase postgres-best-practices; do ` +
-      `if [ -d "/tmp/supabase-skills-src/skills/$d" ]; then cp -r "/tmp/supabase-skills-src/skills/$d" ${SKILLS_DIR}/supabase/; fi; ` +
-      `done && rm -rf /tmp/supabase-skills-src`,
-      { timeoutMs: 60000 }
-    );
-  } catch (err) {
-    console.warn('Failed to fetch Supabase agent skills (non-fatal):', err.message);
-  }
-  try {
-    const doc = await db.collection('agent_sessions').doc(sessionId).get();
-    if (doc.exists && doc.data().repo && GITHUB_USERNAME && GITHUB_TOKEN) {
-      const repo = doc.data().repo;
-      const remoteUrl = `https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/${repo}.git`;
+    try {
       await sbx.commands.run(
-        `git clone "${remoteUrl}" /tmp/_restore 2>&1 && cp -r /tmp/_restore/. ${PROJECT_DIR}/ && rm -rf /tmp/_restore`,
+        `git clone --depth 1 https://github.com/anthropics/skills.git /tmp/anthropic-skills-src 2>&1 && ` +
+        `mkdir -p ${SKILLS_DIR}/anthropic && ` +
+        `for d in frontend-design web-artifacts-builder; do ` +
+        `if [ -d "/tmp/anthropic-skills-src/skills/$d" ]; then cp -r "/tmp/anthropic-skills-src/skills/$d" ${SKILLS_DIR}/anthropic/; fi; ` +
+        `done && rm -rf /tmp/anthropic-skills-src`,
         { timeoutMs: 60000 }
       );
-      console.log(`Restored project from ${repo} for session ${sessionId}`);
+    } catch (err) {
+      console.warn('Failed to fetch Anthropic example skills (non-fatal):', err.message);
     }
-  } catch (err) {
-    console.warn('Failed to auto-restore project from GitHub (non-fatal):', err.message);
+    try {
+      await sbx.commands.run(
+        `git clone --depth 1 https://github.com/supabase/agent-skills.git /tmp/supabase-skills-src 2>&1 && ` +
+        `mkdir -p ${SKILLS_DIR}/supabase && ` +
+        `for d in supabase postgres-best-practices; do ` +
+        `if [ -d "/tmp/supabase-skills-src/skills/$d" ]; then cp -r "/tmp/supabase-skills-src/skills/$d" ${SKILLS_DIR}/supabase/; fi; ` +
+        `done && rm -rf /tmp/supabase-skills-src`,
+        { timeoutMs: 60000 }
+      );
+    } catch (err) {
+      console.warn('Failed to fetch Supabase agent skills (non-fatal):', err.message);
+    }
+    try {
+      const doc = await db.collection('agent_sessions').doc(sessionId).get();
+      if (doc.exists && doc.data().repo && GITHUB_USERNAME && GITHUB_TOKEN) {
+        const repo = doc.data().repo;
+        const remoteUrl = `https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/${repo}.git`;
+        await sbx.commands.run(
+          `git clone ${shellQuote(remoteUrl)} /tmp/_restore 2>&1 && cp -r /tmp/_restore/. ${PROJECT_DIR}/ && rm -rf /tmp/_restore`,
+          { timeoutMs: 60000 }
+        );
+        console.log(`Restored project from ${repo} for session ${sessionId}`);
+      }
+    } catch (err) {
+      console.warn('Failed to auto-restore project from GitHub (non-fatal):', err.message);
+    }
+    sandboxes.set(sessionId, { sandbox: sbx, lastUsed: Date.now() });
+    return sbx;
+  })();
+
+  sandboxCreationLocks.set(sessionId, creationPromise);
+  try {
+    return await creationPromise;
+  } finally {
+    sandboxCreationLocks.delete(sessionId);
   }
-  sandboxes.set(sessionId, { sandbox: sbx, lastUsed: Date.now() });
-  return sbx;
 }
 
 // ---- Tool (function) definitions given to Gemini ----
@@ -475,9 +537,15 @@ async function executeTool(sbx, name, args, sessionId) {
   try {
     switch (name) {
       case 'run_command': {
+        let safeCwd;
+        try {
+          safeCwd = args.cwd ? resolveInWorkspace(args.cwd, [PROJECT_DIR]) : PROJECT_DIR;
+        } catch (err) {
+          return { error: err.message };
+        }
         try {
           const result = await sbx.commands.run(args.command, {
-            cwd: args.cwd || PROJECT_DIR,
+            cwd: safeCwd,
             timeoutMs: 120000 // 2 min per command; tune as needed
           });
           return {
@@ -494,12 +562,22 @@ async function executeTool(sbx, name, args, sessionId) {
         }
       }
       case 'write_file': {
-        const filePath = args.path.startsWith('/') ? args.path : `${PROJECT_DIR}/${args.path}`;
+        let filePath;
+        try {
+          filePath = resolveInWorkspace(args.path, [PROJECT_DIR]);
+        } catch (err) {
+          return { error: err.message };
+        }
         await sbx.files.write(filePath, args.content);
         return { success: true };
       }
       case 'patch_file': {
-        const filePath = args.path.startsWith('/') ? args.path : `${PROJECT_DIR}/${args.path}`;
+        let filePath;
+        try {
+          filePath = resolveInWorkspace(args.path, [PROJECT_DIR]);
+        } catch (err) {
+          return { error: err.message };
+        }
         let content;
         try {
           content = await sbx.files.read(filePath);
@@ -518,20 +596,31 @@ async function executeTool(sbx, name, args, sessionId) {
         return { success: true, path: filePath };
       }
       case 'read_file': {
-        const filePath = args.path.startsWith('/') ? args.path : `${PROJECT_DIR}/${args.path}`;
+        let filePath;
+        try {
+          filePath = resolveInWorkspace(args.path, [PROJECT_DIR, SKILLS_DIR]);
+        } catch (err) {
+          return { error: err.message };
+        }
         const content = await sbx.files.read(filePath);
         return { content };
       }
       case 'list_files': {
-        const targetPath = args.path
-          ? (args.path.startsWith('/') ? args.path : `${PROJECT_DIR}/${args.path}`)
-          : PROJECT_DIR;
+        let targetPath;
+        try {
+          targetPath = resolveInWorkspace(args.path, [PROJECT_DIR, SKILLS_DIR]);
+        } catch (err) {
+          return { error: err.message };
+        }
         const entries = await sbx.files.list(targetPath);
         return { entries };
       }
       case 'commit_and_push': {
         if (!GITHUB_USERNAME || !GITHUB_TOKEN) {
           return { error: 'GITHUB_USERNAME/GITHUB_TOKEN not configured on the server' };
+        }
+        if (!args.repo || !/^[\w.-]+\/[\w.-]+$/.test(args.repo)) {
+          return { error: 'Invalid repo format, expected "owner/repo-name"' };
         }
         try {
           const checkResponse = await fetch(`https://api.github.com/repos/${args.repo}`, {
@@ -556,10 +645,13 @@ async function executeTool(sbx, name, args, sessionId) {
         } catch (err) {
           console.warn('Repo existence check/auto-create failed (continuing to attempt push anyway):', err.message);
         }
-        const cwd = args.cwd || PROJECT_DIR;
-        const msg = (args.commitMessage || 'Update from AI agent').replace(/"/g, '\\"');
-        // Token is injected here on the server side only — Gemini never sees
-        // the raw token, since it only ever supplies "repo" and "commitMessage".
+        let cwd;
+        try {
+          cwd = args.cwd ? resolveInWorkspace(args.cwd, [PROJECT_DIR]) : PROJECT_DIR;
+        } catch (err) {
+          return { error: err.message };
+        }
+        const commitMsg = args.commitMessage || 'Update from AI agent';
         const remoteUrl = `https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/${args.repo}.git`;
 
         const steps = [
@@ -567,9 +659,9 @@ async function executeTool(sbx, name, args, sessionId) {
           `git config user.email "agent@local"`,
           `git config user.name "${GITHUB_USERNAME}"`,
           `git add -A`,
-          `git commit -m "${msg}" --allow-empty`,
+          `git commit -m ${shellQuote(commitMsg)} --allow-empty`,
           `git branch -M main`,
-          `git remote remove origin 2>/dev/null; git remote add origin "${remoteUrl}"`,
+          `git remote remove origin 2>/dev/null; git remote add origin ${shellQuote(remoteUrl)}`,
           `git push -u origin main`
         ];
 
@@ -665,8 +757,13 @@ async function executeTool(sbx, name, args, sessionId) {
         if (!vercelProjectName) {
           vercelProjectName = `agent-${sessionId.replace(/[^a-zA-Z0-9-]/g, '').slice(0, 40) || Date.now()}`;
         }
-        const cwd = args.cwd || PROJECT_DIR;
-        const linkCommand = `VERCEL_TOKEN="${vercelToken}" npx vercel link --yes --project="${vercelProjectName}"`;
+        let cwd;
+        try {
+          cwd = args.cwd ? resolveInWorkspace(args.cwd, [PROJECT_DIR]) : PROJECT_DIR;
+        } catch (err) {
+          return { error: err.message };
+        }
+        const linkCommand = `VERCEL_TOKEN="${vercelToken}" npx vercel link --yes --project=${shellQuote(vercelProjectName)}`;
         try {
           await sbx.commands.run(linkCommand, { cwd, timeoutMs: 60000 });
         } catch (err) {
@@ -704,9 +801,14 @@ async function executeTool(sbx, name, args, sessionId) {
         if (!projectName) {
           return { error: 'No projectName provided and no previous Cloudflare project found for this session. Provide a projectName to start a new deployment.' };
         }
-        const cwd = args.cwd || PROJECT_DIR;
+        let cwd;
+        try {
+          cwd = args.cwd ? resolveInWorkspace(args.cwd, [PROJECT_DIR]) : PROJECT_DIR;
+        } catch (err) {
+          return { error: err.message };
+        }
         const deployDir = args.buildDir || '.';
-        const command = `export NVM_DIR="$HOME/.nvm"; if [ ! -s "$NVM_DIR/nvm.sh" ]; then curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash > /dev/null 2>&1; fi; \\. "$NVM_DIR/nvm.sh"; nvm install 22 > /dev/null 2>&1; nvm use 22 > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages project create "${projectName}" --production-branch main > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages deploy ${deployDir} --project-name="${projectName}"`;
+        const command = `export NVM_DIR="$HOME/.nvm"; if [ ! -s "$NVM_DIR/nvm.sh" ]; then curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash > /dev/null 2>&1; fi; \\. "$NVM_DIR/nvm.sh"; nvm install 22 > /dev/null 2>&1; nvm use 22 > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages project create ${shellQuote(projectName)} --production-branch main > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages deploy ${shellQuote(deployDir)} --project-name=${shellQuote(projectName)}`;
         try {
           const result = await sbx.commands.run(command, { cwd, timeoutMs: 240000 });
           try {
@@ -726,7 +828,7 @@ async function executeTool(sbx, name, args, sessionId) {
         const cfToken = process.env.CLOUDFLARE_API_TOKEN;
         const cfAccountId = process.env.CLOUDFLARE_ACCOUNT_ID;
         if (!cfToken || !cfAccountId) return { error: 'CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID not configured on the server' };
-        const command = `export NVM_DIR="$HOME/.nvm"; if [ ! -s "$NVM_DIR/nvm.sh" ]; then curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash > /dev/null 2>&1; fi; \\. "$NVM_DIR/nvm.sh"; nvm install 22 > /dev/null 2>&1; nvm use 22 > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages project delete "${args.projectName}" --force`;
+        const command = `export NVM_DIR="$HOME/.nvm"; if [ ! -s "$NVM_DIR/nvm.sh" ]; then curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash > /dev/null 2>&1; fi; \\. "$NVM_DIR/nvm.sh"; nvm install 22 > /dev/null 2>&1; nvm use 22 > /dev/null 2>&1; CLOUDFLARE_API_TOKEN="${cfToken}" CLOUDFLARE_ACCOUNT_ID="${cfAccountId}" npx wrangler pages project delete ${shellQuote(args.projectName)} --force`;
         try {
           const result = await sbx.commands.run(command, { timeoutMs: 240000 });
           return { stdout: redactSecrets(result.stdout), stderr: redactSecrets(result.stderr), exitCode: result.exitCode };
@@ -770,11 +872,16 @@ async function executeTool(sbx, name, args, sessionId) {
         }
         const buffer = Buffer.from(await response.arrayBuffer());
         const filename = args.filename || 'screenshot.png';
-        const filePath = `${PROJECT_DIR}/${filename}`;
+        let filePath;
+        try {
+          filePath = resolveInWorkspace(filename, [PROJECT_DIR]);
+        } catch (err) {
+          return { error: err.message };
+        }
         await sbx.files.write(filePath, buffer);
         let publicUrl = null;
         try {
-          publicUrl = await uploadToCloudinary(buffer, filename);
+          publicUrl = await uploadToCloudinary(buffer, path.basename(filePath));
         } catch (err) {
           console.warn('Failed to upload screenshot to Cloudinary (non-fatal):', err.message);
         }
@@ -784,10 +891,13 @@ async function executeTool(sbx, name, args, sessionId) {
         if (!GITHUB_USERNAME || !GITHUB_TOKEN) {
           return { error: 'GITHUB_USERNAME/GITHUB_TOKEN not configured on the server' };
         }
+        if (!args.repo || !/^[\w.-]+\/[\w.-]+$/.test(args.repo)) {
+          return { error: 'Invalid repo format, expected "owner/repo-name"' };
+        }
         const remoteUrl = `https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/${args.repo}.git`;
         try {
           const result = await sbx.commands.run(
-            `rm -rf ${PROJECT_DIR}/* ${PROJECT_DIR}/.[!.]* 2>/dev/null; git clone "${remoteUrl}" ${PROJECT_DIR} 2>&1 || git clone "${remoteUrl}" /tmp/_clone && cp -r /tmp/_clone/. ${PROJECT_DIR}/ && rm -rf /tmp/_clone`,
+            `rm -rf ${PROJECT_DIR}/* ${PROJECT_DIR}/.[!.]* 2>/dev/null; git clone ${shellQuote(remoteUrl)} ${PROJECT_DIR} 2>&1 || git clone ${shellQuote(remoteUrl)} /tmp/_clone && cp -r /tmp/_clone/. ${PROJECT_DIR}/ && rm -rf /tmp/_clone`,
             { timeoutMs: 60000 }
           );
           return { stdout: redactSecrets(result.stdout), stderr: redactSecrets(result.stderr), exitCode: result.exitCode };
@@ -803,11 +913,16 @@ async function executeTool(sbx, name, args, sessionId) {
         }
         const buffer = Buffer.from(await response.arrayBuffer());
         const filename = args.filename || 'generated-image.png';
-        const filePath = `${PROJECT_DIR}/${filename}`;
+        let filePath;
+        try {
+          filePath = resolveInWorkspace(filename, [PROJECT_DIR]);
+        } catch (err) {
+          return { error: err.message };
+        }
         await sbx.files.write(filePath, buffer);
         let publicUrl = null;
         try {
-          publicUrl = await uploadToCloudinary(buffer, filename);
+          publicUrl = await uploadToCloudinary(buffer, path.basename(filePath));
         } catch (err) {
           console.warn('Failed to upload generated image to Cloudinary (non-fatal):', err.message);
         }
@@ -815,6 +930,13 @@ async function executeTool(sbx, name, args, sessionId) {
       }
       case 'create_github_repo': {
         if (!GITHUB_TOKEN) return { error: 'GITHUB_TOKEN not configured on the server' };
+        if (args.repo && !/^[\w.-]+\/[\w.-]+$/.test(args.repo)) {
+          return { error: 'Invalid repo format, expected "owner/repo-name"' };
+        }
+        const repoName = args.name || (args.repo ? args.repo.split('/').pop() : '');
+        if (!repoName) {
+          return { error: 'Repo name is required' };
+        }
         const response = await fetch('https://api.github.com/user/repos', {
           method: 'POST',
           headers: {
@@ -823,7 +945,7 @@ async function executeTool(sbx, name, args, sessionId) {
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            name: args.name,
+            name: repoName,
             description: args.description || '',
             private: args.private || false
           })
@@ -1275,6 +1397,29 @@ const PROVIDER_RUNNERS = {
   nvidia: runNvidiaTurn
 };
 
+function isTransientError(err) {
+  const msg = (err && (err.message || String(err))) || '';
+  const status = err?.status || err?.statusCode || err?.response?.status;
+  if (status === 400 || status === 401 || status === 403 || status === 404) return false;
+  if (/context.*length|maximum context/i.test(msg)) return false;
+  if (/\b(400|401|403|404)\b/.test(msg) && !/500|502|503|504|429/.test(msg)) return false;
+  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) return true;
+  if (/429|502|503|504|timeout|timed out|network|econnreset|econnrefused|fetch failed|rate limit/i.test(msg)) {
+    return true;
+  }
+  return false;
+}
+
+function sanitizeHistory(rawHistory) {
+  if (!Array.isArray(rawHistory)) return [];
+  return rawHistory
+    .filter(turn => turn && typeof turn === 'object' && typeof turn.content === 'string')
+    .map(turn => ({
+      role: turn.role === 'user' || turn.role === 'assistant' ? turn.role : 'user',
+      content: String(turn.content).slice(0, 32000)
+    }));
+}
+
 // ---- Chat runner with multi-provider fallback ----
 async function runChatWithFallback(message, history, sbx, sessionId, onEvent = () => {}, preferredModel = null) {
   let chainToTry = FALLBACK_CHAIN;
@@ -1291,28 +1436,62 @@ async function runChatWithFallback(message, history, sbx, sessionId, onEvent = (
   let progressNote = '';
 
   for (const { provider, model } of chainToTry) {
-    try {
-      onEvent({ type: 'model_selected', provider, model });
-      const runner = PROVIDER_RUNNERS[provider];
-      const { reply, toolLog, loops } = await runner(model, message, history, sbx, sessionId, onEvent, progressNote);
-      return {
-        reply,
-        toolLog: [...accumulatedToolLog, ...toolLog],
-        loopsUsed: loops,
-        hitLoopCap: loops >= MAX_TOOL_LOOPS,
-        modelUsed: `${provider}:${model}`
-      };
-    } catch (err) {
-      const errMsg = (err && (err.message || String(err))) || '';
-      console.warn(`Provider ${provider}/${model} failed: ${errMsg}`);
-      onEvent({ type: 'model_failed', provider, model, error: errMsg });
-      if (err.partialToolLog && err.partialToolLog.length > 0) {
-        accumulatedToolLog = [...accumulatedToolLog, ...err.partialToolLog];
-        progressNote = err.partialToolLog
-          .map(t => `- Called ${t.tool} with ${JSON.stringify(t.args)} → ${t.result?.error ? 'failed: ' + t.result.error : 'succeeded'}`)
-          .join('\n');
+    let attempts = 0;
+    const maxAttempts = 2; // initial attempt + 1 same-provider retry if transient
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        onEvent({ type: 'model_selected', provider, model, attempt: attempts });
+        const runner = PROVIDER_RUNNERS[provider];
+        const { reply, toolLog, loops } = await runner(model, message, history, sbx, sessionId, onEvent, progressNote);
+        const hitLoopCap = loops >= MAX_TOOL_LOOPS;
+        return {
+          reply,
+          toolLog: [...accumulatedToolLog, ...toolLog],
+          loopsUsed: loops,
+          hitLoopCap,
+          status: hitLoopCap ? 'interrupted' : 'completed',
+          reason: hitLoopCap ? 'max_loops_exceeded' : null,
+          resumeAvailable: hitLoopCap,
+          modelUsed: `${provider}:${model}`
+        };
+      } catch (err) {
+        const errMsg = (err && (err.message || String(err))) || '';
+        console.warn(`Provider ${provider}/${model} attempt ${attempts} failed: ${errMsg}`);
+        onEvent({ type: 'model_failed', provider, model, error: errMsg, attempt: attempts });
+
+        if (err.partialToolLog && err.partialToolLog.length > 0) {
+          accumulatedToolLog = [...accumulatedToolLog, ...err.partialToolLog];
+          progressNote = err.partialToolLog
+            .map(t => `- Called ${t.tool} with ${JSON.stringify(t.args)} → ${t.result?.error ? 'failed: ' + t.result.error : 'succeeded'}`)
+            .join('\n');
+        }
+
+        if (attempts < maxAttempts && isTransientError(err)) {
+          console.log(`Retrying provider ${provider}/${model} in 2s due to transient error...`);
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+
+        let workspaceFiles = '';
+        try {
+          const result = await sbx.commands.run(`find ${PROJECT_DIR} -maxdepth 3 -not -path '*/.*' -not -path '*/node_modules*'`, { timeoutMs: 5000 });
+          workspaceFiles = result.stdout.trim();
+        } catch {}
+        let gitState = '';
+        try {
+          const result = await sbx.commands.run('git status --short 2>&1', { cwd: PROJECT_DIR, timeoutMs: 5000 });
+          gitState = result.stdout.trim();
+        } catch {}
+        progressNote = [
+          progressNote,
+          workspaceFiles ? `Existing files in workspace:\n${workspaceFiles}` : '',
+          gitState ? `Git status:\n${gitState}` : ''
+        ].filter(Boolean).join('\n\n');
+
+        break;
       }
-      continue;
     }
   }
   throw new Error('All providers in the fallback chain failed.');
@@ -1341,15 +1520,34 @@ app.post('/chat', requireAppSecret, async (req, res) => {
     return res.status(400).json({ error: 'message and sessionId are required' });
   }
 
+  const cleanHistory = sanitizeHistory(history);
+  const isValidPreferred = preferredModel &&
+    typeof preferredModel === 'object' &&
+    FALLBACK_CHAIN.some(e => e.provider === preferredModel.provider && e.model === preferredModel.model);
+  const safePreferredModel = isValidPreferred ? preferredModel : null;
+
   try {
     const sbx = await getOrCreateSandbox(sessionId);
-    const result = await runChatWithFallback(message, history, sbx, sessionId, () => {}, preferredModel);
+    const result = await runChatWithFallback(message, cleanHistory, sbx, sessionId, () => {}, safePreferredModel);
     if ((!result.reply || !result.reply.trim()) && result.hitLoopCap) {
       const toolNames = result.toolLog.map(t => t.tool).join(', ');
       result.reply = `I ran out of steps before finishing this task. So far I used these tools: ${toolNames || 'none'}. Try asking me to continue, or break the task into smaller steps.`;
     }
+    try {
+      await db.collection('agent_sessions').doc(sessionId).collection('history').add({
+        userMessage: message,
+        assistantReply: result.reply,
+        modelUsed: result.modelUsed,
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } catch (err) {
+      console.warn('Failed to persist turn history (non-fatal):', err.message);
+    }
     res.json({
       ...result,
+      status: result.status || (result.hitLoopCap ? 'interrupted' : 'completed'),
+      reason: result.reason !== undefined ? result.reason : (result.hitLoopCap ? 'max_loops_exceeded' : null),
+      resumeAvailable: result.resumeAvailable !== undefined ? result.resumeAvailable : Boolean(result.hitLoopCap),
       visitedUrls: extractVisitedUrls(result.toolLog)
     });
   } catch (err) {
@@ -1364,6 +1562,12 @@ app.post('/chat/stream', requireAppSecret, async (req, res) => {
     return res.status(400).json({ error: 'message and sessionId are required' });
   }
 
+  const cleanHistory = sanitizeHistory(history);
+  const isValidPreferred = preferredModel &&
+    typeof preferredModel === 'object' &&
+    FALLBACK_CHAIN.some(e => e.provider === preferredModel.provider && e.model === preferredModel.model);
+  const safePreferredModel = isValidPreferred ? preferredModel : null;
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -1376,10 +1580,20 @@ app.post('/chat/stream', requireAppSecret, async (req, res) => {
 
   try {
     const sbx = await getOrCreateSandbox(sessionId);
-    const result = await runChatWithFallback(message, history, sbx, sessionId, send, preferredModel);
+    const result = await runChatWithFallback(message, cleanHistory, sbx, sessionId, send, safePreferredModel);
     if ((!result.reply || !result.reply.trim()) && result.hitLoopCap) {
       const toolNames = result.toolLog.map(t => t.tool).join(', ');
       result.reply = `I ran out of steps before finishing this task. So far I used these tools: ${toolNames || 'none'}. Try asking me to continue, or break the task into smaller steps.`;
+    }
+    try {
+      await db.collection('agent_sessions').doc(sessionId).collection('history').add({
+        userMessage: message,
+        assistantReply: result.reply,
+        modelUsed: result.modelUsed,
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } catch (err) {
+      console.warn('Failed to persist turn history (non-fatal):', err.message);
     }
     send({
       type: 'done',
@@ -1387,6 +1601,9 @@ app.post('/chat/stream', requireAppSecret, async (req, res) => {
       toolLog: result.toolLog,
       loopsUsed: result.loopsUsed,
       hitLoopCap: result.hitLoopCap,
+      status: result.status || (result.hitLoopCap ? 'interrupted' : 'completed'),
+      reason: result.reason !== undefined ? result.reason : (result.hitLoopCap ? 'max_loops_exceeded' : null),
+      resumeAvailable: result.resumeAvailable !== undefined ? result.resumeAvailable : Boolean(result.hitLoopCap),
       modelUsed: result.modelUsed,
       visitedUrls: extractVisitedUrls(result.toolLog)
     });
